@@ -1,0 +1,102 @@
+"""
+Tiny SQLite store mapping Discord user <-> Stripe customer/subscription.
+
+Needed because Stripe's "subscription cancelled" webhook only gives us a
+Stripe customer ID, not a Discord user ID - so we have to remember that
+mapping ourselves from the moment checkout completes.
+
+Uses stdlib sqlite3 (sync) wrapped in asyncio.to_thread so it never blocks
+the bot's event loop. Fine at this scale; if you outgrow a single SQLite
+file (thousands of concurrent writes) swap this module for Postgres later
+without touching any calling code.
+"""
+import asyncio
+import sqlite3
+from datetime import datetime, timezone
+
+
+def _connect(path: str) -> sqlite3.Connection:
+    return sqlite3.connect(path)
+
+
+def _init_db_sync(path: str):
+    conn = _connect(path)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subscribers (
+            discord_user_id TEXT PRIMARY KEY,
+            stripe_customer_id TEXT,
+            stripe_subscription_id TEXT,
+            status TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_stripe_customer ON subscribers(stripe_customer_id)")
+    conn.commit()
+    conn.close()
+
+
+async def init_db(path: str):
+    await asyncio.to_thread(_init_db_sync, path)
+
+
+def _upsert_sync(path, discord_user_id, stripe_customer_id, stripe_subscription_id, status):
+    conn = _connect(path)
+    conn.execute(
+        """
+        INSERT INTO subscribers (discord_user_id, stripe_customer_id, stripe_subscription_id, status, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(discord_user_id) DO UPDATE SET
+            stripe_customer_id = excluded.stripe_customer_id,
+            stripe_subscription_id = excluded.stripe_subscription_id,
+            status = excluded.status,
+            updated_at = excluded.updated_at
+        """,
+        (discord_user_id, stripe_customer_id, stripe_subscription_id, status,
+         datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+async def upsert_subscriber(path, discord_user_id, stripe_customer_id, stripe_subscription_id, status):
+    await asyncio.to_thread(_upsert_sync, path, discord_user_id, stripe_customer_id, stripe_subscription_id, status)
+
+
+def _get_by_discord_sync(path, discord_user_id):
+    conn = _connect(path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM subscribers WHERE discord_user_id = ?", (discord_user_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+async def get_by_discord_id(path, discord_user_id):
+    return await asyncio.to_thread(_get_by_discord_sync, path, discord_user_id)
+
+
+def _get_by_customer_sync(path, stripe_customer_id):
+    conn = _connect(path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM subscribers WHERE stripe_customer_id = ?", (stripe_customer_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+async def get_by_customer_id(path, stripe_customer_id):
+    return await asyncio.to_thread(_get_by_customer_sync, path, stripe_customer_id)
+
+
+def _set_status_sync(path, stripe_customer_id, status):
+    conn = _connect(path)
+    conn.execute(
+        "UPDATE subscribers SET status = ?, updated_at = ? WHERE stripe_customer_id = ?",
+        (status, datetime.now(timezone.utc).isoformat(), stripe_customer_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+async def set_status_by_customer_id(path, stripe_customer_id, status):
+    await asyncio.to_thread(_set_status_sync, path, stripe_customer_id, status)
