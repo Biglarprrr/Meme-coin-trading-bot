@@ -1,0 +1,37 @@
+"""
+Shared data shapes passed between sources -> scorer -> notifier.
+"""
+from dataclasses import dataclass, field
+from time import time
+
+
+@dataclass
+class Candidate:
+    address: str                       # token mint address (Solana)
+    symbol: str = ""
+    name: str = ""
+    chain: str = "solana"
+
+    # signals gathered from various sources
+    first_seen_source: str = ""        # "pumpfun" | "telegram"
+    initial_buy_sol: float = 0.0
+    market_cap_sol: float = 0.0
+    telegram_mentions: int = 0
+    telegram_channels_seen: set = field(default_factory=set)
+
+    # enrichment from DexScreener (filled in later)
+    liquidity_usd: float = 0.0
+    volume_5m_usd: float = 0.0
+    volume_1h_usd: float = 0.0
+    price_change_5m_pct: float = 0.0
+    dex_url: str = ""
+
+    score: float = 0.0
+    created_at: float = field(default_factory=time)
+
+    def links(self) -> dict:
+        return {
+            "pump.fun": f"https://pump.fun/{self.address}",
+            "dexscreener": self.dex_url or f"https://dexscreener.com/solana/{self.address}",
+            "birdeye": f"https://birdeye.so/token/{self.address}?chain=solana",
+        }
