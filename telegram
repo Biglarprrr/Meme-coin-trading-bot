@@ -1,0 +1,64 @@
+"""
+Monitors Telegram channels you're already a member of for mentions of
+Solana token addresses. Uses your own Telegram account (via Telethon),
+not a bot - because bots can't read channels they weren't added to as
+admin, and most "alpha call" channels won't add a bot.
+
+This is meant for personal monitoring of channels you already follow.
+Don't use this to mass-join thousands of channels or scrape at scale -
+that's a different (and much more ToS-risky) project than "alert me
+when my alpha groups mention a token."
+
+First run will prompt for your phone number + login code interactively
+in the terminal, then save a session file so you won't need to log in
+again.
+"""
+import asyncio
+import logging
+import re
+
+from telethon import TelegramClient, events
+
+from models import Candidate
+
+log = logging.getLogger("telegram")
+
+# Solana addresses are base58, typically 32-44 chars, no 0/O/I/l characters.
+SOLANA_ADDRESS_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
+
+
+async def watch_telegram(
+    api_id: str,
+    api_hash: str,
+    session_name: str,
+    channels: list,
+    queue: asyncio.Queue,
+):
+    if not channels:
+        log.info("No TELEGRAM_CHANNELS configured, skipping Telegram source.")
+        return
+
+    client = TelegramClient(session_name, int(api_id), api_hash)
+    await client.start()
+    log.info("Telegram client started, watching %d channel(s)", len(channels))
+
+    @client.on(events.NewMessage(chats=channels))
+    async def handler(event):
+        text = event.raw_text or ""
+        addresses = set(SOLANA_ADDRESS_RE.findall(text))
+        if not addresses:
+            return
+
+        chat = await event.get_chat()
+        channel_name = getattr(chat, "username", None) or getattr(chat, "title", "unknown")
+
+        for addr in addresses:
+            candidate = Candidate(
+                address=addr,
+                first_seen_source="telegram",
+                telegram_mentions=1,
+            )
+            candidate.telegram_channels_seen.add(channel_name)
+            await queue.put(candidate)
+
+    await client.run_until_disconnected()
