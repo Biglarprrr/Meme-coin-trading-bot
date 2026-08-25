@@ -1,0 +1,34 @@
+"""
+Builds the Discord embed for an alert. Posting happens via the bot's own
+channel.send() in bot.py now instead of a webhook POST, since alerts need
+to land in a role-gated channel the bot is already a member of.
+"""
+import discord
+
+from models import Candidate
+
+
+def build_alert_embed(c: Candidate) -> discord.Embed:
+    links = c.links()
+
+    description = (
+        f"**Score: {c.score:.0f}/100**\n"
+        f"Liquidity: ${c.liquidity_usd:,.0f} | "
+        f"Vol 5m: ${c.volume_5m_usd:,.0f} | Vol 1h: ${c.volume_1h_usd:,.0f}\n"
+        f"5m price change: {c.price_change_5m_pct:+.1f}%\n"
+        f"First seen via: {c.first_seen_source}"
+    )
+    if c.telegram_channels_seen:
+        description += f"\nMentioned in {len(c.telegram_channels_seen)} Telegram channel(s)"
+
+    embed = discord.Embed(
+        title=f"{c.name or '?'} (${c.symbol or '?'})",
+        url=links["dexscreener"],
+        description=description,
+        color=discord.Color.green() if c.score >= 75 else discord.Color.orange(),
+    )
+    embed.add_field(name="Address", value=f"`{c.address}`", inline=False)
+    embed.add_field(name="pump.fun", value=links["pump.fun"], inline=True)
+    embed.add_field(name="Birdeye", value=links["birdeye"], inline=True)
+    embed.set_footer(text="Not financial advice. DYOR - check holder concentration and liquidity lock before acting.")
+    return embed
