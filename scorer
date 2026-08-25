@@ -1,0 +1,60 @@
+"""
+Turns raw signals into a single 0-100 score. This is a starting-point
+heuristic, not a magic filter - tune the weights and thresholds in .env
+and here as you see what actually correlates with outcomes you care about.
+
+None of this predicts whether a token is a scam or a rug. It only measures
+"is there unusually early liquidity/volume/attention." Always eyeball a
+token yourself (holder concentration, whether liquidity is locked, contract
+authorities) before acting on an alert.
+"""
+from models import Candidate
+
+
+def score_candidate(c: Candidate) -> float:
+    score = 0.0
+
+    # --- liquidity: dead liquidity = can't exit position ---
+    if c.liquidity_usd >= 20000:
+        score += 25
+    elif c.liquidity_usd >= 8000:
+        score += 15
+    elif c.liquidity_usd >= 3000:
+        score += 8
+
+    # --- volume momentum ---
+    if c.volume_5m_usd >= 10000:
+        score += 25
+    elif c.volume_5m_usd >= 3000:
+        score += 15
+    elif c.volume_5m_usd >= 500:
+        score += 7
+
+    if c.volume_1h_usd >= 50000:
+        score += 10
+    elif c.volume_1h_usd >= 15000:
+        score += 5
+
+    # --- price momentum (short-term, noisy on purpose - just a signal) ---
+    if c.price_change_5m_pct >= 50:
+        score += 10
+    elif c.price_change_5m_pct >= 15:
+        score += 5
+
+    # --- pump.fun early-buy signal ---
+    if c.initial_buy_sol >= 5:
+        score += 10
+    elif c.initial_buy_sol >= 1:
+        score += 5
+
+    # --- social confirmation: multiple independent channels talking
+    # about the same token is a stronger signal than one channel spamming ---
+    channel_count = len(c.telegram_channels_seen)
+    if channel_count >= 3:
+        score += 20
+    elif channel_count == 2:
+        score += 12
+    elif channel_count == 1:
+        score += 5
+
+    return min(score, 100.0)
