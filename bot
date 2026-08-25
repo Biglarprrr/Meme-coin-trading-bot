@@ -1,0 +1,222 @@
+"""
+v2 entry point. Single process running:
+  - the Discord bot (slash commands + posting alerts to a gated channel)
+  - the Stripe webhook receiver (grants/revokes the paid role)
+  - the pump.fun + Telegram watchers feeding the same scoring pipeline as v1
+
+Run with:  python bot.py
+
+One-time setup (see README for full details):
+  1. Create a bot application in the Discord Developer Portal, invite it
+     to your server with `bot` + `applications.commands` scopes and
+     View Channels / Send Messages / Embed Links / Manage Roles permissions.
+  2. In your server: create a "Subscriber" role and a gated #alerts channel
+     (permission overwrite: @everyone can't view, Subscriber can). Make sure
+     the bot's own role sits ABOVE Subscriber in the role list.
+  3. Create a recurring Price in Stripe, set up a webhook endpoint pointing
+     at your tunnel URL + /stripe/webhook.
+  4. Fill in .env, then run this file.
+"""
+import asyncio
+import logging
+import time
+
+import aiohttp
+import discord
+from discord import app_commands
+from discord.ext import commands
+from aiohttp import web
+
+from config import CONFIG
+from models import Candidate
+from scorer import score_candidate
+from alerts import build_alert_embed
+from sources.pumpfun import watch_pumpfun
+from sources.dexscreener import enrich_with_dexscreener
+from sources.telegram_source import watch_telegram
+from payments import db
+from payments.stripe_checkout import create_checkout_session, create_billing_portal_session
+from payments.webhook_server import create_webhook_app
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("bot")
+
+# Slash commands only, no message content read -> no privileged intents needed
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+alert_queue: asyncio.Queue = asyncio.Queue()
+http_session: aiohttp.ClientSession | None = None
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in CONFIG.admin_user_ids
+
+
+# ---------------------------------------------------------------- commands
+
+@bot.tree.command(name="subscribe", description="Get a payment link for alert access")
+async def subscribe(interaction: discord.Interaction):
+    url = await asyncio.to_thread(create_checkout_session, str(interaction.user.id))
+    await interaction.response.send_message(
+        f"Here's your subscription link (private to you):\n{url}", ephemeral=True
+    )
+
+
+@bot.tree.command(name="mystatus", description="Check your subscription status")
+async def mystatus(interaction: discord.Interaction):
+    record = await db.get_by_discord_id(CONFIG.db_path, str(interaction.user.id))
+    if not record:
+        await interaction.response.send_message(
+            "No subscription on file. Use /subscribe to get access.", ephemeral=True
+        )
+        return
+    await interaction.response.send_message(f"Status: **{record['status']}**", ephemeral=True)
+
+
+@bot.tree.command(name="manage", description="Manage or cancel your subscription")
+async def manage(interaction: discord.Interaction):
+    record = await db.get_by_discord_id(CONFIG.db_path, str(interaction.user.id))
+    if not record or not record.get("stripe_customer_id"):
+        await interaction.response.send_message("No active subscription found.", ephemeral=True)
+        return
+    url = await asyncio.to_thread(create_billing_portal_session, record["stripe_customer_id"])
+    await interaction.response.send_message(f"Manage your subscription here:\n{url}", ephemeral=True)
+
+
+@bot.tree.command(name="setthreshold", description="[admin] Change the minimum alert score (0-100)")
+@app_commands.describe(value="New score threshold")
+async def setthreshold(interaction: discord.Interaction, value: float):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    CONFIG.min_score_threshold = value
+    await interaction.response.send_message(f"Score threshold updated to {value}", ephemeral=True)
+
+
+@bot.tree.command(name="stats", description="[admin] Bot status")
+async def stats(interaction: discord.Interaction):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"Score threshold: {CONFIG.min_score_threshold}\n"
+        f"Queue backlog: {alert_queue.qsize()}",
+        ephemeral=True,
+    )
+
+
+# ------------------------------------------------------------ alert engine
+
+async def alert_consumer():
+    """Same merge -> enrich -> score -> alert pipeline as v1, but posts
+    into the gated Discord channel via the bot instead of a webhook."""
+    known: dict[str, Candidate] = {}
+    last_alerted: dict[str, float] = {}
+
+    await bot.wait_until_ready()
+    channel = bot.get_channel(CONFIG.alerts_channel_id)
+    if channel is None:
+        log.error(
+            "Could not find alerts channel %s - check ALERTS_CHANNEL_ID and "
+            "that the bot has View Channel access to it", CONFIG.alerts_channel_id,
+        )
+
+    while True:
+        incoming: Candidate = await alert_queue.get()
+        now = time.time()
+
+        existing = known.get(incoming.address)
+        if existing:
+            existing.telegram_mentions += incoming.telegram_mentions
+            existing.telegram_channels_seen |= incoming.telegram_channels_seen
+            if incoming.initial_buy_sol:
+                existing.initial_buy_sol = incoming.initial_buy_sol
+            if incoming.market_cap_sol:
+                existing.market_cap_sol = incoming.market_cap_sol
+            if incoming.symbol and incoming.symbol != "?":
+                existing.symbol = incoming.symbol
+            if incoming.name and incoming.name != "?":
+                existing.name = incoming.name
+            candidate = existing
+        else:
+            candidate = incoming
+            known[candidate.address] = candidate
+
+        last_time = last_alerted.get(candidate.address, 0)
+        if now - last_time < CONFIG.alert_cooldown_seconds:
+            continue
+
+        enrichment = await enrich_with_dexscreener(http_session, candidate.address)
+        if enrichment:
+            candidate.liquidity_usd = enrichment.get("liquidity_usd", candidate.liquidity_usd)
+            candidate.volume_5m_usd = enrichment.get("volume_5m_usd", candidate.volume_5m_usd)
+            candidate.volume_1h_usd = enrichment.get("volume_1h_usd", candidate.volume_1h_usd)
+            candidate.price_change_5m_pct = enrichment.get("price_change_5m_pct", candidate.price_change_5m_pct)
+            candidate.dex_url = enrichment.get("dex_url", candidate.dex_url)
+
+        if candidate.liquidity_usd < CONFIG.min_liquidity_usd:
+            continue
+
+        candidate.score = score_candidate(candidate)
+        log.info(
+            "Scored %s (%s): %.0f  [liq=$%.0f vol5m=$%.0f mentions=%d]",
+            candidate.symbol, candidate.address[:8], candidate.score,
+            candidate.liquidity_usd, candidate.volume_5m_usd, len(candidate.telegram_channels_seen),
+        )
+
+        if candidate.score >= CONFIG.min_score_threshold and channel is not None:
+            await channel.send(embed=build_alert_embed(candidate))
+            last_alerted[candidate.address] = now
+            log.info("ALERT sent for %s (score %.0f)", candidate.symbol, candidate.score)
+
+
+# --------------------------------------------------------------- lifecycle
+
+@bot.event
+async def setup_hook():
+    """Runs once before on_ready - start every background service here."""
+    global http_session
+    http_session = aiohttp.ClientSession()
+
+    await db.init_db(CONFIG.db_path)
+
+    webhook_app = create_webhook_app(bot)
+    runner = web.AppRunner(webhook_app)
+    await runner.setup()
+    site = web.TCPSite(runner, CONFIG.webhook_server_host, CONFIG.webhook_server_port)
+    await site.start()
+    log.info("Stripe webhook server listening on %s:%s/stripe/webhook",
+              CONFIG.webhook_server_host, CONFIG.webhook_server_port)
+
+    bot.loop.create_task(watch_pumpfun(CONFIG.pumpfun_ws_url, alert_queue, CONFIG.min_initial_buy_sol))
+    bot.loop.create_task(alert_consumer())
+
+    if CONFIG.telegram_channels:
+        bot.loop.create_task(watch_telegram(
+            CONFIG.telegram_api_id,
+            CONFIG.telegram_api_hash,
+            CONFIG.telegram_session_name,
+            CONFIG.telegram_channels,
+            alert_queue,
+        ))
+
+    await bot.tree.sync()
+
+
+@bot.event
+async def on_ready():
+    log.info("Logged in as %s (guild=%s)", bot.user, CONFIG.discord_guild_id)
+
+
+if __name__ == "__main__":
+    problems = CONFIG.validate()
+    if problems:
+        for p in problems:
+            log.error("Config problem: %s", p)
+        log.error("Fix your .env before running. See .env.example.")
+    else:
+        bot.run(CONFIG.discord_bot_token)
