@@ -1,0 +1,78 @@
+"""
+Local HTTP server that Stripe calls when subscription events happen
+(payment succeeded, subscription cancelled, etc). Built on aiohttp.web
+instead of Flask because it runs in the same asyncio event loop and
+process as the Discord bot and the watchers - no threading needed to mix
+a sync Flask server with an async bot.
+
+This server needs to be reachable from the public internet for Stripe to
+reach it. On a home PC that means a tunnel - see README for ngrok /
+Cloudflare Tunnel setup. Never expose your bare home IP directly.
+"""
+import logging
+
+import stripe
+from aiohttp import web
+
+from config import CONFIG
+from payments import db
+from payments.discord_roles import grant_subscriber_role, revoke_subscriber_role
+
+log = logging.getLogger("stripe_webhook")
+
+CANCELLED_STATUSES = ("canceled", "unpaid", "incomplete_expired")
+
+
+def create_webhook_app(bot) -> web.Application:
+    app = web.Application()
+
+    async def handle_webhook(request: web.Request) -> web.Response:
+        payload = await request.read()
+        sig_header = request.headers.get("Stripe-Signature", "")
+
+        try:
+            event = stripe.Webhook.construct_event(payload, sig_header, CONFIG.stripe_webhook_secret)
+        except ValueError:
+            log.warning("Stripe webhook: malformed payload")
+            return web.Response(status=400)
+        except stripe.error.SignatureVerificationError:
+            log.warning("Stripe webhook: signature verification failed")
+            return web.Response(status=400)
+
+        event_type = event["type"]
+        data = event["data"]["object"]
+
+        if event_type == "checkout.session.completed":
+            discord_user_id = data.get("client_reference_id") or (data.get("metadata") or {}).get("discord_user_id")
+            customer_id = data.get("customer")
+            subscription_id = data.get("subscription")
+
+            if not discord_user_id:
+                log.warning("checkout.session.completed with no discord_user_id attached - can't grant a role")
+            else:
+                await db.upsert_subscriber(CONFIG.db_path, discord_user_id, customer_id, subscription_id, "active")
+                await grant_subscriber_role(bot, discord_user_id)
+
+        elif event_type == "customer.subscription.deleted":
+            customer_id = data.get("customer")
+            record = await db.get_by_customer_id(CONFIG.db_path, customer_id)
+            if record:
+                await db.set_status_by_customer_id(CONFIG.db_path, customer_id, "canceled")
+                await revoke_subscriber_role(bot, record["discord_user_id"])
+
+        elif event_type == "customer.subscription.updated":
+            status = data.get("status")
+            customer_id = data.get("customer")
+            if status in CANCELLED_STATUSES:
+                record = await db.get_by_customer_id(CONFIG.db_path, customer_id)
+                if record:
+                    await db.set_status_by_customer_id(CONFIG.db_path, customer_id, status)
+                    await revoke_subscriber_role(bot, record["discord_user_id"])
+
+        else:
+            log.debug("Unhandled Stripe event type: %s", event_type)
+
+        return web.Response(status=200)
+
+    app.router.add_post("/stripe/webhook", handle_webhook)
+    return app
