@@ -1,0 +1,88 @@
+"""
+Central config. Loads everything from .env so no secrets live in code.
+"""
+import os
+from dataclasses import dataclass, field
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _float(name: str, default: float) -> float:
+    val = os.getenv(name)
+    return float(val) if val else default
+
+
+def _int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    return int(val) if val else default
+
+
+def _int_list(name: str) -> list:
+    val = os.getenv(name, "")
+    return [int(x.strip()) for x in val.split(",") if x.strip()]
+
+
+@dataclass
+class Config:
+    # --- Discord bot ---
+    discord_bot_token: str = os.getenv("DISCORD_BOT_TOKEN", "")
+    discord_guild_id: int = _int("DISCORD_GUILD_ID", 0)
+    alerts_channel_id: int = _int("ALERTS_CHANNEL_ID", 0)
+    subscriber_role_id: int = _int("SUBSCRIBER_ROLE_ID", 0)
+    admin_user_ids: list = field(default_factory=lambda: _int_list("ADMIN_USER_IDS"))
+
+    # --- Stripe ---
+    stripe_secret_key: str = os.getenv("STRIPE_SECRET_KEY", "")
+    stripe_webhook_secret: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+    stripe_price_id: str = os.getenv("STRIPE_PRICE_ID", "")
+    stripe_success_url: str = os.getenv("STRIPE_SUCCESS_URL", "https://discord.com")
+    stripe_cancel_url: str = os.getenv("STRIPE_CANCEL_URL", "https://discord.com")
+
+    # --- Webhook receiver (local server Stripe calls) ---
+    webhook_server_host: str = os.getenv("WEBHOOK_SERVER_HOST", "0.0.0.0")
+    webhook_server_port: int = _int("WEBHOOK_SERVER_PORT", 4242)
+
+    db_path: str = os.getenv("DB_PATH", "subscribers.db")
+
+    # --- Telegram (free, from https://my.telegram.org/apps) ---
+    telegram_api_id: str = os.getenv("TELEGRAM_API_ID", "")
+    telegram_api_hash: str = os.getenv("TELEGRAM_API_HASH", "")
+    telegram_session_name: str = os.getenv("TELEGRAM_SESSION_NAME", "memecoin_bot_session")
+    telegram_channels: list = field(default_factory=lambda: [
+        c.strip() for c in os.getenv("TELEGRAM_CHANNELS", "").split(",") if c.strip()
+    ])
+
+    # --- Pump.fun data source ---
+    pumpfun_ws_url: str = os.getenv("PUMPFUN_WS_URL", "wss://pumpportal.fun/api/data")
+
+    # --- Filters / thresholds ---
+    min_initial_buy_sol: float = _float("MIN_INITIAL_BUY_SOL", 1.0)
+    min_liquidity_usd: float = _float("MIN_LIQUIDITY_USD", 3000)
+    min_score_threshold: float = _float("MIN_SCORE_THRESHOLD", 55)
+    alert_cooldown_seconds: int = _int("ALERT_COOLDOWN_SECONDS", 21600)
+
+    def validate(self):
+        problems = []
+        if not self.discord_bot_token:
+            problems.append("DISCORD_BOT_TOKEN is not set")
+        if not self.discord_guild_id:
+            problems.append("DISCORD_GUILD_ID is not set")
+        if not self.alerts_channel_id:
+            problems.append("ALERTS_CHANNEL_ID is not set")
+        if not self.subscriber_role_id:
+            problems.append("SUBSCRIBER_ROLE_ID is not set")
+        if not self.stripe_secret_key:
+            problems.append("STRIPE_SECRET_KEY is not set")
+        if not self.stripe_webhook_secret:
+            problems.append("STRIPE_WEBHOOK_SECRET is not set")
+        if not self.stripe_price_id:
+            problems.append("STRIPE_PRICE_ID is not set")
+        if not self.admin_user_ids:
+            problems.append("ADMIN_USER_IDS is not set (you won't be able to use /setthreshold or /stats)")
+        if self.telegram_channels and (not self.telegram_api_id or not self.telegram_api_hash):
+            problems.append("TELEGRAM_CHANNELS is set but TELEGRAM_API_ID/HASH are missing")
+        return problems
+
+
+CONFIG = Config()
