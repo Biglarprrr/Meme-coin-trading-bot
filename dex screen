@@ -1,0 +1,46 @@
+"""
+DexScreener REST client. Free, no API key required, rate-limited
+(roughly 300 req/min on pair endpoints as of 2026) - so callers should
+avoid hammering it per-message; enrichment is called once per candidate
+and then periodically for tokens already on the watchlist.
+"""
+import asyncio
+import logging
+
+import aiohttp
+
+log = logging.getLogger("dexscreener")
+
+BASE_URL = "https://api.dexscreener.com"
+
+
+async def enrich_with_dexscreener(session: aiohttp.ClientSession, token_address: str) -> dict:
+    """
+    Returns liquidity/volume/price data for a token address, or an empty
+    dict if the token has no indexed pair yet (common for brand-new
+    pump.fun launches that haven't hit a DEX pool).
+    """
+    url = f"{BASE_URL}/latest/dex/tokens/{token_address}"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return {}
+            data = await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        log.warning("DexScreener request failed for %s: %s", token_address, e)
+        return {}
+
+    pairs = data.get("pairs") or []
+    if not pairs:
+        return {}
+
+    # pick the pair with the highest liquidity if there are multiple pools
+    best = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
+
+    return {
+        "liquidity_usd": (best.get("liquidity") or {}).get("usd") or 0.0,
+        "volume_5m_usd": (best.get("volume") or {}).get("m5") or 0.0,
+        "volume_1h_usd": (best.get("volume") or {}).get("h1") or 0.0,
+        "price_change_5m_pct": (best.get("priceChange") or {}).get("m5") or 0.0,
+        "dex_url": best.get("url", ""),
+    }
