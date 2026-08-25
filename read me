@@ -1,0 +1,160 @@
+# Memecoin Alert Bot v2 (Solana / pump.fun) — paid Discord access
+
+Same detection pipeline as v1 (pump.fun launches + Telegram mentions,
+scored using DexScreener liquidity/volume), but now:
+- Alerts post via a real **Discord bot** into a **role-gated channel**
+  instead of a public webhook
+- People pay through **Stripe Checkout**; on successful payment the bot
+  automatically grants them the role that unlocks the alerts channel
+- Cancel/refund/failed-payment events automatically **revoke** the role
+- `/subscribe`, `/mystatus`, `/manage` slash commands for members;
+  `/setthreshold`, `/stats` for you
+
+**This bot still only sends alerts — it never trades or touches a wallet.**
+
+## Before you launch: a few honest things to know
+
+- **Selling trading alerts for money can touch securities regulation**
+  depending on how you frame it (raw scored data vs. "buy this now" calls,
+  and depending on your jurisdiction). I'm not a lawyer and this isn't legal
+  advice — worth 20-30 minutes reading up on how this is treated in Canada
+  before you take payment from strangers.
+- **Stripe needs a public URL to reach your webhook.** Your home PC is
+  behind NAT, so `python bot.py` alone isn't reachable from the internet.
+  You need a tunnel (ngrok / Cloudflare Tunnel) running alongside it, or
+  eventually a small always-on VPS. Setup for both is below.
+- **The pump.fun feed is still an unofficial third-party relay** — no
+  official pump.fun API exists. If it stops producing events, see the note
+  in `sources/pumpfun.py`.
+- **Refunds/chargebacks happen.** Stripe's dashboard is where you'll handle
+  disputes; this bot doesn't do anything special for them beyond removing
+  the role when Stripe tells it the subscription ended.
+
+## One-time setup
+
+### 1. Install dependencies
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Create the Discord bot application
+1. Go to https://discord.com/developers/applications → **New Application**
+2. **Bot** tab → **Reset Token** → copy it → this is `DISCORD_BOT_TOKEN`
+3. Still on the Bot tab: you do **not** need to enable any Privileged
+   Gateway Intents (this bot uses slash commands only, never reads message
+   content)
+4. **OAuth2 → URL Generator**: check scopes `bot` and `applications.commands`.
+   Under bot permissions check: View Channels, Send Messages, Embed Links,
+   Manage Roles. Copy the generated URL, open it, invite the bot to your
+   server.
+
+### 3. Set up the gated channel and role
+1. In your server: **Server Settings → Roles → Create Role**, name it
+   e.g. `Subscriber`. Drag it in the role list so it's **above** where
+   `@everyone` sits but — importantly — make sure your **bot's own role is
+   positioned above `Subscriber`** in the list (Discord refuses to let a
+   bot grant a role ranked higher than the bot's own role).
+2. Create a channel, e.g. `#alerts`. Open its permission settings, remove
+   `@everyone`'s "View Channel" permission, then add a permission override
+   for `Subscriber` with "View Channel" and "Read Message History" allowed.
+   Make sure your bot's role can also view it.
+3. Turn on Developer Mode (User Settings → Advanced) so you can right-click
+   to copy IDs: right-click your server icon → Copy Server ID
+   (`DISCORD_GUILD_ID`), right-click `#alerts` → Copy Channel ID
+   (`ALERTS_CHANNEL_ID`), right-click the `Subscriber` role → Copy Role ID
+   (`SUBSCRIBER_ROLE_ID`), right-click your own name → Copy User ID for
+   `ADMIN_USER_IDS`.
+
+### 4. Set up Stripe
+1. https://dashboard.stripe.com → **Product catalog → Add product**.
+   Set it up as a **recurring** price (monthly/yearly, whatever you're
+   charging). Copy the Price ID (starts `price_...`) → `STRIPE_PRICE_ID`.
+2. **Developers → API keys** → copy the **Secret key** → `STRIPE_SECRET_KEY`
+   (use a **test mode** key while you're setting this up, switch to live
+   only once everything works end to end).
+3. Webhook endpoint — do this *after* step 5 below once you have a public
+   URL: **Developers → Webhooks → Add endpoint**, URL =
+   `https://<your-tunnel-url>/stripe/webhook`, and select these events:
+   `checkout.session.completed`, `customer.subscription.deleted`,
+   `customer.subscription.updated`. Copy the **Signing secret**
+   (`whsec_...`) → `STRIPE_WEBHOOK_SECRET`.
+
+For local testing before you have a permanent tunnel, the **Stripe CLI**
+is faster than setting up a dashboard webhook every time:
+```bash
+stripe listen --forward-to localhost:4242/stripe/webhook
+```
+This prints its own `whsec_...` you can use temporarily in `.env`.
+
+### 5. Expose your webhook receiver to the internet
+Pick one:
+- **ngrok** (fastest to start):
+  ```bash
+  ngrok http 4242
+  ```
+  Gives you a URL like `https://abcd1234.ngrok-free.app` — use that as
+  your Stripe webhook endpoint. Free ngrok URLs change every restart,
+  which means updating the Stripe webhook URL each time — fine while
+  testing, annoying long-term.
+- **Cloudflare Tunnel** (free, and the URL can be made permanent with a
+  domain you own): https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/
+- **Eventually**: a $5-6/mo VPS (DigitalOcean/Linode/Hetzner) running just
+  `bot.py` full-time solves this and the "PC has to stay on 24/7" problem
+  at once. Nothing in this code needs to change to move it there.
+
+### 6. (Optional) Telegram source
+Same as v1 — get free credentials at https://my.telegram.org/apps, add
+them plus `TELEGRAM_CHANNELS` to `.env`. First run will prompt for a login
+code once, then saves a session file.
+
+### 7. Configure and run
+```bash
+cp .env.example .env
+# fill in everything from steps 2-6
+python bot.py
+```
+Leave it running — same as v1, this is a long-running process, not a
+one-shot script. See v1's notes on Task Scheduler / nohup / systemd if you
+want it to survive reboots, or just move to a VPS per step 5.
+
+## Commands
+
+| Command | Who | What it does |
+|---|---|---|
+| `/subscribe` | anyone | DMs an ephemeral Stripe Checkout link |
+| `/mystatus` | anyone | Shows their current subscription status |
+| `/manage` | anyone | Link to Stripe's self-service portal to cancel/update card |
+| `/setthreshold <value>` | admins only | Live-adjusts `MIN_SCORE_THRESHOLD` |
+| `/stats` | admins only | Shows current threshold + queue backlog |
+
+## How the payment flow works end to end
+
+```
+User runs /subscribe
+   -> bot creates a Stripe Checkout session (discord_user_id in metadata)
+   -> user pays on Stripe's hosted page
+   -> Stripe calls your /stripe/webhook with checkout.session.completed
+   -> bot looks up their Discord ID from the event, saves it in subscribers.db,
+      grants them the Subscriber role
+   -> they can now see #alerts
+
+Later, if they cancel or a payment fails permanently:
+   -> Stripe calls /stripe/webhook with customer.subscription.deleted
+   -> bot looks up their Discord ID by Stripe customer ID (from subscribers.db)
+   -> revokes the Subscriber role
+```
+
+`subscribers.db` (SQLite, created automatically) is the only state this
+adds beyond v1 — back it up if you care about not losing the
+Discord-user ↔ Stripe-customer mapping.
+
+## Extending further
+
+- **Tiered access** (e.g. free delayed alerts + instant paid alerts):
+  add a second role/channel and a second Stripe Price, branch `/subscribe`
+  on which tier they pick.
+- **Web dashboard** for subscribers to see the full watchlist history
+  instead of just live alerts — would sit alongside the webhook server as
+  another aiohttp.web route.
+- Everything from v1's "Extending" section (Twitter once you have paid API
+  access, on-chain risk scoring) still applies unchanged.
